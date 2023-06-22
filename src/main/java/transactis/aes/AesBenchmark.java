@@ -10,7 +10,9 @@ import org.openjdk.jmh.runner.options.OptionsBuilder;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.*;
 import java.security.SecureRandom;
 import java.util.concurrent.TimeUnit;
@@ -19,13 +21,20 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 @State(Scope.Benchmark)
 public class AesBenchmark {
-    static private int BUFFER_SIZE=200000;// 2 Mo at a time
-    private Cipher c1, c2, c3;
+    static private int BUFFER_SIZE=4096;// 2 Mo at a time
+    private Cipher c1, c2, c3, c4, c5;
     private SecretKey sk;
-    private String benchmarkFilePath = "./src/main/resources/file.txt";
-    private String encryptedFilePath = "./src/main/resources/file_enc.txt";
+    private String benchmarkFilePath = "./src/main/resources/file";
+    private String encryptedFilePath = "./src/main/resources/file_enc";
     private ProcessBuilder processBuilder;
     private File benchmarkFile;
+
+    private static final int CHACHA_NONCE_LENGTH = 12;
+    private static final int GCM_IV_LENGTH = 12;
+    private static final int GCM_TAG_LENGTH = 16;
+    private static final int CHACHA_KEY_SIZE = 256;
+    private SecretKey skc,skg;
+    private byte[] nonce;
 
     @Setup
     public void prepare() throws Exception {
@@ -33,26 +42,38 @@ public class AesBenchmark {
 
         // Default AES key length = 128 bit
         sk = KeyGenerator.getInstance("AES").generateKey();
-        byte[] iv = new byte[16];
+        skg = KeyGenerator.getInstance("AES").generateKey();
+        KeyGenerator keyGen = KeyGenerator.getInstance("ChaCha20");
+        keyGen.init(256, SecureRandom.getInstanceStrong());
+        skc = keyGen.generateKey();
+
+        byte[] iv = generateRandomBytes(GCM_IV_LENGTH);
+        byte[] ivg = generateRandomBytes(GCM_IV_LENGTH);
         (new SecureRandom()).nextBytes(iv);
         IvParameterSpec ips = new IvParameterSpec(iv);
 
-        String cipherName = "AES/CTR/NoPadding";
+        String AESCTRCipherName = "AES/CTR/NoPadding";
+        String AESGCMCipherName = "AES/GCM/NoPadding";
 
-        c1 = Cipher.getInstance(cipherName);
+        c1 = Cipher.getInstance(AESCTRCipherName);
         c1.init(Cipher.ENCRYPT_MODE, sk, ips);
 
-        c2 = Cipher.getInstance(cipherName, "BC");
+        c2 = Cipher.getInstance(AESCTRCipherName, "BC");
         c2.init(Cipher.ENCRYPT_MODE, sk, ips);
 
-        c3 = Cipher.getInstance(cipherName);
+        c3 = Cipher.getInstance(AESCTRCipherName);
         c3.init(Cipher.ENCRYPT_MODE, sk, ips);
 
-        byte[] ptxt = new byte[1 << 5000000];//50 Mo file
+        c4 = Cipher.getInstance(AESGCMCipherName);
+        c4.init(Cipher.ENCRYPT_MODE, skg, new GCMParameterSpec(GCM_TAG_LENGTH * 8, ivg));
+
+        nonce = generateRandomBytes(CHACHA_NONCE_LENGTH);
+
+        c5 = Cipher.getInstance("ChaCha20");
+        c5.init(Cipher.ENCRYPT_MODE, skc, new IvParameterSpec(nonce));
+
         benchmarkFile = new File(benchmarkFilePath);
-        try (FileOutputStream outputStream = new FileOutputStream(benchmarkFile)) {
-            outputStream.write(ptxt);
-        }
+
         // Construct the OpenSSL command for file encryption
         String[] opensslCommand = {
                 "openssl",
@@ -81,8 +102,8 @@ public class AesBenchmark {
     @Benchmark
     @BenchmarkMode(Mode.AverageTime)
     @OutputTimeUnit(MILLISECONDS)
-    @Warmup(iterations = 4)
-    @Measurement(iterations = 20)
+    @Warmup(iterations = 3)
+    @Measurement(iterations = 10)
     @Fork(value = 1)
     public void aes_jdk() throws Exception {
         try (FileInputStream inputStream = new FileInputStream(benchmarkFile)){
@@ -90,6 +111,7 @@ public class AesBenchmark {
         }
         byte[] finaleCipherData = c1.doFinal();
         try(OutputStream outputStream = new FileOutputStream(encryptedFilePath)){
+            outputStream.write(c1.getIV());
             outputStream.write(finaleCipherData);
         }
     }
@@ -97,24 +119,25 @@ public class AesBenchmark {
     @Benchmark
     @BenchmarkMode(Mode.AverageTime)
     @OutputTimeUnit(MILLISECONDS)
-    @Warmup(iterations = 4)
-    @Measurement(iterations = 20)
-    @Fork(value = 1)
+    @Warmup(iterations = 3)
+    @Measurement(iterations = 10)
+    @Fork(value = 0)
     public void aes_bc() throws Exception {
         try (FileInputStream inputStream = new FileInputStream(benchmarkFile)){
             c2.update(inputStream.readAllBytes());
         }
         byte[] finaleCipherData = c2.doFinal();
         try(OutputStream outputStream = new FileOutputStream(encryptedFilePath)){
+            outputStream.write(c2.getIV());
             outputStream.write(finaleCipherData);
         }
     }
     @Benchmark
     @BenchmarkMode(Mode.AverageTime)
     @OutputTimeUnit(MILLISECONDS)
-    @Warmup(iterations = 4)
-    @Measurement(iterations = 20)
-    @Fork(value = 1)
+    @Warmup(iterations = 3)
+    @Measurement(iterations = 10)
+    @Fork(value = 0)
     public void aes_openssl_native() throws Exception {
         Process process = processBuilder.start();
 //        int exitCode = process.waitFor();
@@ -127,9 +150,41 @@ public class AesBenchmark {
     @Benchmark
     @BenchmarkMode(Mode.AverageTime)
     @OutputTimeUnit(MILLISECONDS)
-    @Warmup(iterations = 4)
-    @Measurement(iterations = 20)
+    @Warmup(iterations = 3)
+    @Measurement(iterations = 10)
     @Fork(value = 1)
+    public void aes_gcm_jdk() throws Exception {
+        try (FileInputStream inputStream = new FileInputStream(benchmarkFile)){
+            c4.update(inputStream.readAllBytes());
+        }
+        byte[] finaleCipherData = c4.doFinal();
+        try(OutputStream outputStream = new FileOutputStream(encryptedFilePath)){
+            outputStream.write(c4.getIV());
+            outputStream.write(finaleCipherData);
+        }
+    }
+    @Benchmark
+    @BenchmarkMode(Mode.AverageTime)
+    @OutputTimeUnit(MILLISECONDS)
+    @Warmup(iterations = 3)
+    @Measurement(iterations = 10)
+    @Fork(value = 1)
+    public void chacha20_jdk() throws Exception {
+        try (FileInputStream inputStream = new FileInputStream(benchmarkFile)){
+            c5.update(inputStream.readAllBytes());
+        }
+        byte[] finaleCipherData = c5.doFinal();
+        try(OutputStream outputStream = new FileOutputStream(encryptedFilePath)){
+            outputStream.write(nonce);
+            outputStream.write(finaleCipherData);
+        }
+    }
+    @Benchmark
+    @BenchmarkMode(Mode.AverageTime)
+    @OutputTimeUnit(MILLISECONDS)
+    @Warmup(iterations = 3)
+    @Measurement(iterations = 10)
+    @Fork(value = 0)
     public void aes_jdk_buffered() throws Exception {
         byte[] buffer = new byte[BUFFER_SIZE];
         int bytesRead; // cursor
@@ -144,5 +199,11 @@ public class AesBenchmark {
                 outputStream.write(finale);
             }
         }
+    }
+    private static byte[] generateRandomBytes(int length) {
+        byte[] bytes = new byte[length];
+        SecureRandom secureRandom = new SecureRandom();
+        secureRandom.nextBytes(bytes);
+        return bytes;
     }
 }
